@@ -13,6 +13,18 @@ import pandas as pd
 import pyvista as pv
 import vtk
 
+# openquake scenario functions
+from openquake.hazardlib.contexts import RuptureContext
+from openquake.hazardlib.contexts import DistancesContext
+from openquake.hazardlib.contexts import SitesContext
+from openquake.hazardlib import imt, const
+
+# active crustal models
+from openquake.hazardlib.gsim.abrahamson_2014 import AbrahamsonEtAl2014
+from openquake.hazardlib.gsim.boore_2014 import BooreEtAl2014
+from openquake.hazardlib.gsim.campbell_bozorgnia_2014 import CampbellBozorgnia2014
+from openquake.hazardlib.gsim.chiou_youngs_2014 import ChiouYoungs2014
+
 class Distances:
     """Calculators for earthquake-site distance metrics needed for GMMs
 
@@ -75,8 +87,10 @@ class Distances:
         Also compensates for hypocentral depth in z-coordinate,
         which is 0 at the hypocenter
 
-        Input: (N,3) array of xyz points
-        Output: (N,3) array of nez points with corrected z-coords
+        Args: 
+            - (N,3): array of xyz points
+        Returns: 
+            - (N,3): array of nez points with corrected z-coords
         """
         point_arr = np.copy(points)
         point_arr[:,[0,1]] = point_arr[:,[1,0]]
@@ -104,7 +118,7 @@ class Distances:
 
     def point_uvPrimew(self,points,convert_xyz=True):
         """Converts point in (x,y,z) (or (e,n,z)) to fault-relative coordinates (u,v,w)
-        Not dependent on dip, used for Rjb and Rx
+        Not dependent on dip; used for Rjb and Rx
         """
         self._require('strike')
         theta = np.radians(self.strike)
@@ -123,7 +137,8 @@ class Distances:
     def calc_Rrup(self, points,convert_xyz=True):
         """Distance to rupture plane
         
-        Input: (n,3) array of xyz coords (centered at the surface)
+        Args: 
+            - (n,3): array of xyz coords (centered at the surface)
 
 
         Set convert_xyz to False if coordinates are already in (n,e,z) format
@@ -148,7 +163,8 @@ class Distances:
     def calc_Rjb(self, points,convert_xyz=True):
         """Distance to surface fault projection (0 at projection)
 
-        Input: (n,3) array of xyz coords (centered at the surface)
+        Args: 
+            - (n,3): array of xyz coords (centered at the surface)
 
         Set convert_xyz to False if coordinates are already in (n,e,z) format
         Otherwise, (x,y,z) is automatically converted to (n,e,z) instead of the incorrect (e,n,z)
@@ -172,7 +188,8 @@ class Distances:
     def calc_Rx(self, points,convert_xyz=True):
         """Distance to x-axis
 
-        Input: (n,3) array of xyz coords (centered at the surface)
+        Args: 
+            - (n,3): array of xyz coords (centered at the surface)
 
         Set convert_xyz to False if coordinates are already in (n,e,z) format
         Otherwise, (x,y,z) is automatically converted to (n,e,z) instead of the incorrect (e,n,z)
@@ -192,12 +209,27 @@ class Distances:
     def calc_Ry0(self,points,convert_xyz=True):
         """Distance to closest end of the top of the fault
 
-        Input: (n,3) array of xyz coords (centered at the surface)
+        Args: 
+            - (n,3): array of xyz coords (centered at the surface)
         """
         self._require('dip', 'fault_width')
         self.frac_hyp_coords()
         self.point_uvPrimew(points,convert_xyz)
         pass
+
+    def shift_x_tor(self,points):
+        """Shifts coordinate x values so that (0,0,0) is the center of the top of the rupture (tor),
+        instead of at the hypocenter.
+        Assumes hypocenter is centered along strike and strike is 0.
+
+        Args: 
+            - (n,3): array of xyz coords (centered at the surface)
+        """
+
+        shift = self.hyp_depth / np.tan(np.radians(self.dip))
+        shifted_x = points[:,0] - shift
+        return shifted_x
+
 
 def gen_surface_grid(lenx,leny,resx,resy):
     """Generates (resx*resx,3)-shape array of points with xyz-coords for map view
@@ -380,13 +412,13 @@ class SeisSolOutput:
         Returns:
             np.ndarray: Array of maximum RotD50 values for all cells in m/s.
 
-            This can be added to a loaded surface mesh using \
-            surface_mesh.cell_data.set_array(mesh_pgv_rotd,'pgv_rotd50') \
+            This can be added to a loaded surface mesh using
+            surface_mesh.cell_data.set_array(mesh_pgv_rotd,'pgv_rotd50')
             to then plot with PyVista plotters.
         """
         fullstart = time.time()
         # store pgvs here
-        n_cells = self.load_surface_mesh().n_cells
+        n_cells = self.load_surface_mesh(0).n_cells
         mesh_pgv_rotd = np.zeros(n_cells)
         tt = self.get_time_steps()
 
@@ -396,10 +428,217 @@ class SeisSolOutput:
             mesh_pgv_rotd = np.maximum(mesh_pgv_rotd,rotd)
             end = time.time()
             if print_status: print(f'Getting PGV Rotd50 for simulation {self.prefix}. \
-                                   Time step {t}/{tt[-1]}. \
-                                    Iteration time: {round(end - start,3)} s',end='\r')
+                                Time step {t}/{tt[-1]}. \
+                                Iteration time: {round(end - start,3)} s',end='\r')
 
         fullend = time.time()
         if print_status: print(f'\nExecution time: {round(fullend - fullstart,3)} s')
 
         return mesh_pgv_rotd
+        
+class Materials:
+    """Handlers for calculating material ground properties based on given parameters.
+
+    Simplifies finding missing parameters for calculating certain properties like ground velocity,
+    and gets parameters from given properties in reverse.
+
+    All functions return their output in the same units as they are input.
+
+    Attr:
+        mu: shear modulus (Pa)
+        rho: density (kg/m^3)
+        K: bulk modulus (Pa)
+        l: lambda, Lamé first parameter
+        Vp: P-wave velocity (m/s)
+        Vs: S wave velocity (m/s)
+    """
+    def __init__(self, mu=None, rho=None, l=None, K=None, Vp=None, Vs=None):
+        self.mu = mu
+        self.rho = rho
+        self.l = l
+        self.K = K if K is not None else None
+
+        if K == None and l != None:
+            self.K = self.l + ((2/3) * self.mu)
+        
+        self.Vp = Vp
+        self.Vs = Vs
+
+    def _require(self, *names):
+        missing = [n for n in names if getattr(self, n) is None]
+        if missing:
+            raise ValueError(f"Missing required properties: {', '.join(missing)}")
+
+    def get_Vs(self):
+        """Gets shear velocity from mu and rho"""
+        self._require('mu','rho')
+        return np.sqrt(self.mu/self.rho)
+
+    def get_Vp(self):
+        """Gets p-wave velocity from K, mu, and rho"""
+        self._require('K','mu','rho')
+        return np.sqrt((self.K + ((4/3) * self.mu)) / self.rho)
+
+    def get_mu(self):
+        """Gets mu from Vs and rho"""
+        self._require('Vs','rho')
+        return self.Vs**2 * self.rho
+
+    def get_K(self):
+        """Gets K from lambda and mu"""
+        self._require('l','mu')
+        return self.l + ((2/3) * self.mu)
+
+    # def get_K(self):
+    #     self._require('Vp','rho','mu')
+    #     return (self.Vp**2 * self.rho) - ((4/3) * self.mu)
+
+def get_fault_norm(strike,dip):
+    """Calculates normal vector of fault plane from strike and dip.
+
+    Args:
+        strike: strike angle (in degrees)
+        dip: dip angle (in degrees)
+
+    Returns:
+        A normalized vector in the normal direction to the plane.
+    """
+    strike_rad = np.deg2rad(strike)
+    dip_rad = np.deg2rad(dip)
+
+    nx = -np.sin(dip_rad) * np.sin(strike_rad)
+    ny = -np.sin(dip_rad) * np.cos(strike_rad)
+    nz = np.cos(dip_rad)
+
+    N = np.array([nx, ny, nz])
+
+    Nn = N / np.linalg.norm(N)
+    # reduce float rounding error values to 0, and round non-zero values
+    Nn = np.array([0 if abs(c) <= 1e-7 else c for c in Nn])
+    Nn.round()
+
+    return Nn
+
+def OpenquakeACScenario(rake,distances,seissoloutput=None,mag=None,dip=None,convert_from_ln=True):
+    """Simplifies syntax for getting PGVs for an Active Crust model scenario using OpenQuake
+
+    This is a simplified context in which Vs30 is assumed at 760 m/s for all points, 
+    and other parameters are also generalized.
+
+    Args:
+        - rake: rupture rake (degrees), which defines fault mechanism. Can be a number, or the strings 
+        "strikeslip" for 0, "normal" for -90, or "thrust" for 90 (float or string)
+        - coords: array of (x,y,z) coords to be used by GMMs. These are automatically converted
+        by the Distances class to (n,e,u) for rotation
+        - distances: object of distance handlers initialized with Distances class (object)
+        - seissoloutput: object of SeisSol output handlers initialized with SeisSolOutput class (object, default None)
+        - mag: earthquake magnitude. If not specified, it is extracted from SeisSol output (float, default None)
+        - dip: rupture dip. If not specified, it is extracted from the distances input (float, default None)
+
+    Returns:
+        - (resx,resy) array: (x,y) grid of GMM PGVs whose resolution is based on SeisSol simulation mesh
+    """
+
+    if mag is None:
+        if seissoloutput:
+            mag = seissoloutput.get_mw()
+        else:
+            raise ValueError("No magnitude found.\
+                             Please input a magnitude or a SeisSolOutput object for a magnitude.")
+
+    if dip is None:
+        dip = distances.dip
+
+    if not isinstance(rake,str):
+        if rake > 180 or rake < -180:
+            raise ValueError("Rake must be between -180 and 180")
+    if not isinstance(rake,(float,int)):
+        if rake in ("ll","llss","left-lateral"):
+            rake = 0
+        elif rake in ("rl","rlss","right-lateral"):
+            rake = 180
+        elif rake in ("n","ns","normal"):
+            rake = -90
+        elif rake in ("t","r","rs","thrust", "reverse"):
+            rake = 90
+        else:
+            raise ValueError("No valid rake value entered. \
+                          Valid strings are 'left-lateral', 'right-lateral' 'normal', 'reverse'.")
+
+        mesh_points = seissoloutput.load_surface_mesh(0).cell_centers().points / 1000
+
+        #OpenQuake scenario setup
+        rctx = RuptureContext()
+        rctx.mag = mag
+        rctx.rake = rake
+        rctx.dip = dip
+        rctx.ztor = distances.ztor
+        rctx.width = distances.fault_width
+        rctx.hypo_depth = distances.hyp_depth
+
+        dctx = DistancesContext()
+
+        #Distances calculated with Distances object functions
+        rrups = distances.calc_Rrup(mesh_points)
+        rjbs = distances.calc_Rjb(mesh_points)
+        rxs = distances.calc_Rx(mesh_points)
+        # ry0s = distances.calc_Ry0(mesh_points)
+
+        npts = rrups.size # number of distance points
+
+        dctx.rrup = rrups 
+        dctx.rjb = rjbs 
+        dctx.rx = rxs 
+        # dctx.ry0 = ry0s
+
+        sitecol_dict = {'sids': np.arange(1, npts + 1), # site id
+                'vs30': 760.0 + np.zeros(npts, dtype=float), # Vs30 value in m/s
+                'vs30measured': np.zeros(npts, dtype=bool), # needed parameter, but does not affect PGVs here
+                'z1pt0': 50.0 + np.zeros(npts, dtype=float), # depth in m (not km) to 1.0 km/s horizon
+                'z2pt5': np.nan + np.zeros(npts, dtype=float), # depth in km (not m) to 2.5 km/s horizon
+                }
+        sitecollection = pd.DataFrame(sitecol_dict)
+
+        sctx = SitesContext(sitecol=sitecollection)
+
+        # Calculate GMM PGVs
+        IMT = imt.PGV()
+        uncertaintytype = const.StdDev.TOTAL
+
+        # Initialize GMMs
+        ASK14 = AbrahamsonEtAl2014()
+        BSSA14 = BooreEtAl2014()
+        CB14 = CampbellBozorgnia2014()
+        CY14 = ChiouYoungs2014()
+
+        # Get log ground motions
+        # First value are median PGVs, second value standard deviation
+        ln_ask14, ln_sd_ask14 = ASK14.get_mean_and_stddevs(sctx, rctx, dctx, IMT, [uncertaintytype])
+        ln_bssa14, ln_sd_bssa14 = BSSA14.get_mean_and_stddevs(sctx, rctx, dctx, IMT, [uncertaintytype])
+        ln_cb14, ln_sd_cb14 = CB14.get_mean_and_stddevs(sctx, rctx, dctx, IMT, [uncertaintytype])
+        ln_cy14, ln_sd_cy14 = CY14.get_mean_and_stddevs(sctx, rctx, dctx, IMT, [uncertaintytype])
+
+        # Get average
+        ln_median_ac14 = 0.25 * (ln_ask14 + ln_bssa14 + ln_cb14 + ln_cy14)
+        ln_sd_ac14 = 0.25 * (ln_sd_ask14[0] + ln_sd_bssa14[0] + ln_sd_cb14[0] + ln_sd_cy14[0]) # sds are in a list of length 1
+
+        if convert_from_ln:
+            # ask, sd_ask = np.exp(ln_ask14), np.exp(ln_sd_ask14)
+            # bssa, sd_bssa = np.exp(ln_bssa14), np.exp(ln_sd_bssa14)
+            # cb, sd_cb = np.exp(ln_cb14), np.exp(ln_sd_cb14)
+            # cy, sd_cy = np.exp(ln_cy14), np.exp(ln_sd_cy14)
+
+            ac, sd_ac = np.exp(ln_median_ac14), np.exp(ln_sd_ac14)
+
+            return ac, sd_ac
+        else:
+            return ln_median_ac14, ln_sd_ac14
+
+            
+
+            
+        
+
+
+
+
